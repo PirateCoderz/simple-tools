@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import sharp from "sharp";
+import JSZip from "jszip";
 import {
   getConverterBySlug,
   getOutputMime,
@@ -11,6 +12,8 @@ import {
 export async function POST(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   let slug = searchParams.get("slug");
+  const isAnalyze = searchParams.get("analyze") === "true";
+  
   if (!slug) {
     const from = searchParams.get("from");
     const to = searchParams.get("to");
@@ -35,69 +38,197 @@ export async function POST(request: NextRequest) {
     if (!Number.isNaN(n) && n >= 1 && n <= 100) quality = Math.round(n);
   }
 
-  let file: File;
-  try {
-    const formData = await request.formData();
-    const raw = formData.get("file");
-    if (!raw || !(raw instanceof File)) {
+  // Handle analysis request (single file only)
+  if (isAnalyze) {
+    try {
+      const formData = await request.formData();
+      const file = formData.get("file");
+      
+      if (!file || !(file instanceof File)) {
+        return NextResponse.json(
+          { error: "Please upload an image file." },
+          { status: 400 }
+        );
+      }
+
+      if (file.size > MAX_FILE_BYTES) {
+        return NextResponse.json(
+          { error: `File too large. Max ${MAX_FILE_BYTES / 1024 / 1024} MB.` },
+          { status: 400 }
+        );
+      }
+
+      const buffer = Buffer.from(await file.arrayBuffer());
+      let pipeline = sharp(buffer);
+
+      switch (config.to) {
+        case "webp":
+          pipeline = pipeline.webp({ quality: quality ?? 85 });
+          break;
+        case "png":
+          pipeline = pipeline.png();
+          break;
+        case "jpeg":
+          pipeline = pipeline.jpeg({ quality: quality ?? 90 });
+          break;
+        default:
+          return NextResponse.json(
+            { error: "Unsupported output format." },
+            { status: 400 }
+          );
+      }
+
+      const outBuffer = await pipeline.toBuffer();
+      const originalSize = file.size;
+      const compressedSize = outBuffer.length;
+      const compressionRatio = ((originalSize - compressedSize) / originalSize) * 100;
+
+      return NextResponse.json({
+        originalSize,
+        compressedSize,
+        compressionRatio: Math.round(compressionRatio * 10) / 10
+      });
+
+    } catch (err) {
+      console.error("Analysis error:", err);
       return NextResponse.json(
-        { error: "Please upload an image file." },
+        { error: "Analysis failed. Check that the file is a valid image." },
         { status: 400 }
       );
     }
-    file = raw;
-  } catch {
+  }
+
+  // Handle conversion request
+  let files: File[] = [];
+  let qualities: number[] = [];
+  try {
+    const formData = await request.formData();
+    
+    // Check if it's a single file (backward compatibility)
+    const singleFile = formData.get("file");
+    if (singleFile && singleFile instanceof File) {
+      files = [singleFile];
+      qualities = [quality ?? getDefaultQuality(config.to)];
+    } else {
+      // Handle multiple files
+      const fileCountRaw = formData.get("fileCount");
+      const fileCount = fileCountRaw ? parseInt(fileCountRaw.toString()) : 0;
+      
+      for (let i = 0; i < fileCount; i++) {
+        const file = formData.get(`file_${i}`);
+        const fileQualityRaw = formData.get(`quality_${i}`);
+        
+        if (file && file instanceof File) {
+          files.push(file);
+          const fileQuality = fileQualityRaw ? parseInt(fileQualityRaw.toString()) : quality ?? getDefaultQuality(config.to);
+          qualities.push(fileQuality);
+        }
+      }
+    }
+    
+    if (files.length === 0) {
+      return NextResponse.json(
+        { error: "Please upload at least one image file." },
+        { status: 400 }
+      );
+    }
+  } catch (error) {
+    console.error("Form data parsing error:", error);
     return NextResponse.json(
       { error: "Invalid form data." },
       { status: 400 }
     );
   }
 
-  if (file.size > MAX_FILE_BYTES) {
-    return NextResponse.json(
-      { error: `File too large. Max ${MAX_FILE_BYTES / 1024 / 1024} MB.` },
-      { status: 400 }
-    );
+  function getDefaultQuality(format: string): number {
+    switch (format) {
+      case "webp": return 85;
+      case "jpeg": return 90;
+      default: return 100;
+    }
   }
 
-  const buffer = Buffer.from(await file.arrayBuffer());
+  // Validate file sizes
+  for (const file of files) {
+    if (file.size > MAX_FILE_BYTES) {
+      return NextResponse.json(
+        { error: `File "${file.name}" is too large. Max ${MAX_FILE_BYTES / 1024 / 1024} MB per file.` },
+        { status: 400 }
+      );
+    }
+  }
 
   try {
-    let pipeline = sharp(buffer);
+    const convertedFiles: { name: string; buffer: Buffer }[] = [];
 
-    switch (config.to) {
-      case "webp":
-        pipeline = pipeline.webp({ quality: quality ?? 85 });
-        break;
-      case "png":
-        pipeline = pipeline.png();
-        break;
-      case "jpeg":
-        pipeline = pipeline.jpeg({ quality: quality ?? 90 });
-        break;
-      default:
-        return NextResponse.json(
-          { error: "Unsupported output format." },
-          { status: 400 }
-        );
+    // Convert each file
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const fileQuality = qualities[i];
+      const buffer = Buffer.from(await file.arrayBuffer());
+      
+      let pipeline = sharp(buffer);
+
+      switch (config.to) {
+        case "webp":
+          pipeline = pipeline.webp({ quality: fileQuality });
+          break;
+        case "png":
+          pipeline = pipeline.png();
+          break;
+        case "jpeg":
+          pipeline = pipeline.jpeg({ quality: fileQuality });
+          break;
+        default:
+          return NextResponse.json(
+            { error: "Unsupported output format." },
+            { status: 400 }
+          );
+      }
+
+      const outBuffer = await pipeline.toBuffer();
+      const ext = getOutputExtension(config.to);
+      const filename = file.name.replace(/\.[^.]+$/, "") + "." + ext;
+      
+      convertedFiles.push({ name: filename, buffer: outBuffer });
     }
 
-    const outBuffer = await pipeline.toBuffer();
-    const mime = getOutputMime(config.to);
-    const ext = getOutputExtension(config.to);
-    const filename = file.name.replace(/\.[^.]+$/, "") + "." + ext;
+    // If single file, return it directly
+    if (convertedFiles.length === 1) {
+      const { name, buffer } = convertedFiles[0];
+      const mime = getOutputMime(config.to);
+      
+      return new NextResponse(new Uint8Array(buffer), {
+        status: 200,
+        headers: {
+          "Content-Type": mime,
+          "Content-Disposition": `attachment; filename="${name}"`,
+        },
+      });
+    }
 
-    return new NextResponse(new Uint8Array(outBuffer), {
+    // If multiple files, create a zip archive
+    const zip = new JSZip();
+    
+    for (const { name, buffer } of convertedFiles) {
+      zip.file(name, buffer);
+    }
+    
+    const zipBuffer = await zip.generateAsync({ type: "arraybuffer" });
+    const zipFilename = `converted_images_${config.from}_to_${config.to}.zip`;
+    
+    return new NextResponse(zipBuffer, {
       status: 200,
       headers: {
-        "Content-Type": mime,
-        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="${zipFilename}"`,
       },
     });
+
   } catch (err) {
     console.error("Convert error:", err);
     return NextResponse.json(
-      { error: "Conversion failed. Check that the file is a valid image." },
+      { error: "Conversion failed. Check that all files are valid images." },
       { status: 400 }
     );
   }

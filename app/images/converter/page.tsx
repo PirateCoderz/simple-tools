@@ -24,7 +24,7 @@ export default function ConverterListPage() {
         Image converters
       </h1>
       <p className="text-muted-foreground mb-8">
-        Choose a conversion. Upload your file and download the result.
+        Choose a conversion. Upload single or multiple files and download the results.
       </p>
       <div className="grid gap-3 sm:grid-cols-2">
         {conversions.map((c) => (
